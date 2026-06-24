@@ -1,0 +1,10 @@
+construction_progress/data/history/
+construction_progress/data/output/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.git/
+README.md
+debug_*.jpg
+api_start*.log

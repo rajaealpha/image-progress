@@ -1,0 +1,15 @@
+INFO:     Started server process [33732]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-06-12 16:49:57,534 [INFO] Downloading current image: https://lnthcivisionuatsg.blob.core.windows.net/ltvisioncontainer/cam_feed/17652
+2026-06-12 16:49:59,363 [INFO] HTTP Request: GET https://lnthcivisionuatsg.blob.core.windows.net/ltvisioncontainer/cam_feed/176525858704212/176525938298926/177261558353795/2026-05-01/src/1777597202154.jpg?sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2027-04-16T17:08:37Z&st=2026-04-16T08:53:37Z&spr=https,http&sig=TMb9Xn6TOIj6HgRYJoLkfzSNHdo9K8FOpdFO2A8fprU%3D "HTTP/1.1 200 OK"
+2026-06-12 16:49:59,927 [INFO] Downloading 1 reference images...
+2026-06-12 16:50:00,218 [INFO] HTTP Request: GET https://lnthcivisionuatsg.blob.core.windows.net/ltvisioncontainer/cam_feed/176525858704212/176525938298926/177261558353795/2026-05-01/src/1777597202154.jpg?sv=2025-11-05&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2027-04-16T17:08:37Z&st=2026-04-16T08:53:37Z&spr=https,http&sig=TMb9Xn6TOIj6HgRYJoLkfzSNHdo9K8FOpdFO2A8fprU%3D "HTTP/1.1 200 OK"
+2026-06-12 16:50:00,737 [INFO] Computing similarities against 1 references...
+2026-06-12 16:50:00,941 [INFO]   Ref  30%: sim=1.0000
+2026-06-12 16:50:00,942 [INFO] Calling Azure AI for confirmation and stage label...
+2026-06-12 16:50:00,953 [INFO] Analysing zone 'Overall Yard' with Azure Vision...
+2026-06-12 16:50:06,624 [INFO] HTTP Request: POST https://hci-bbs-aifoundry.services.ai.azure.com/api/projects/hci-bbs-proj/openai/v1/responses "HTTP/1.1 200 OK"
+2026-06-12 16:50:11,162 [INFO] HTTP Request: POST https://hci-bbs-aifoundry.services.ai.azure.com/api/projects/hci-bbs-proj/openai/v1/responses "HTTP/1.1 200 OK"
+2026-06-12 16:50:11,207 [INFO] === Result: 30.0% (Foundation) confidence=1.00 ===

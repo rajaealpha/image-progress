@@ -1,0 +1,2 @@
+INFO:     127.0.0.1:58011 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58017 - "POST /analyze HTTP/1.1" 200 OK
