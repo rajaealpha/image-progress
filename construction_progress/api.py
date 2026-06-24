@@ -118,12 +118,87 @@ def _bytes_to_cv2(data: bytes) -> np.ndarray:
         raise ValueError("Could not decode image")
     return img
 
+def _align_image_to_reference(src: np.ndarray, ref: np.ndarray) -> tuple[np.ndarray, bool]:
+    """
+    Align src image to match ref image using ORB feature matching + homography.
+    Handles camera position shifts, slight rotations, zoom changes.
+
+    Returns (aligned_image, success).
+    Falls back to original src if alignment fails (not enough features / bad homography).
+    """
+    try:
+        # Resize both to same size for feature matching
+        h, w = ref.shape[:2]
+        src_resized = cv2.resize(src, (w, h), interpolation=cv2.INTER_AREA)
+
+        gray_ref = cv2.cvtColor(ref,         cv2.COLOR_BGR2GRAY)
+        gray_src = cv2.cvtColor(src_resized, cv2.COLOR_BGR2GRAY)
+
+        orb = cv2.ORB_create(nfeatures=1000)
+        kp_ref, des_ref = orb.detectAndCompute(gray_ref, None)
+        kp_src, des_src = orb.detectAndCompute(gray_src, None)
+
+        if des_ref is None or des_src is None or len(kp_ref) < 10 or len(kp_src) < 10:
+            return src_resized, False
+
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        raw_matches = matcher.knnMatch(des_src, des_ref, k=2)
+
+        # Lowe ratio test — keep only strong matches
+        good = [m for m, n in raw_matches if m.distance < 0.75 * n.distance]
+
+        if len(good) < 10:
+            logger.warning("Alignment: only %d good matches — skipping alignment", len(good))
+            return src_resized, False
+
+        pts_src = np.float32([kp_src[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        pts_ref = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(pts_src, pts_ref, cv2.RANSAC, 5.0)
+
+        if H is None:
+            return src_resized, False
+
+        # Reject bad homography — large determinant means extreme distortion
+        det = abs(np.linalg.det(H[:2, :2]))
+        if det < 0.1 or det > 10.0:
+            logger.warning("Alignment: bad homography determinant=%.3f — skipping", det)
+            return src_resized, False
+
+        aligned = cv2.warpPerspective(src_resized, H, (w, h),
+                                      flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REFLECT)
+        inlier_ratio = mask.ravel().sum() / len(good)
+        logger.info("Alignment: %d good matches, inlier_ratio=%.2f, det=%.3f",
+                    len(good), inlier_ratio, det)
+        return aligned, True
+
+    except Exception as e:
+        logger.warning("Alignment failed: %s", e)
+        return src, False
+
+
 def _normalize_polygon(polygon: list[PolygonPoint], img_w: int, img_h: int) -> list[list[float]]:
+    """
+    Convert polygon points to 0-1 fractions relative to img_w / img_h.
+
+    Handles all three formats callers may send:
+      - Pixel coords  (x > 1 or y > 1)  → divide by image dimensions
+      - Fraction coords (all 0-1)        → use as-is
+      - Mixed                            → treat as pixel (safer — dividing a 0-1
+                                           value by 1920 produces a negligible crop,
+                                           which is caught by the empty-crop check)
+
+    Always clamps output to [0, 1] so out-of-bounds points don't crash cv2.
+    """
     pts = [[p.x, p.y] for p in polygon]
     is_pixel = any(p[0] > 1.0 or p[1] > 1.0 for p in pts)
     if is_pixel:
-        return [[round(p[0] / img_w, 6), round(p[1] / img_h, 6)] for p in pts]
-    return [[round(p[0], 6), round(p[1], 6)] for p in pts]
+        result = [[p[0] / img_w, p[1] / img_h] for p in pts]
+    else:
+        result = [[p[0], p[1]] for p in pts]
+    # Clamp to [0,1] — guards against polygons drawn slightly outside image bounds
+    return [[round(min(1.0, max(0.0, x)), 6), round(min(1.0, max(0.0, y)), 6)] for x, y in result]
 
 def _draw_zone(
     image: np.ndarray,
@@ -196,7 +271,14 @@ async def analyze(req: AnalyzeRequest):
             raise HTTPException(400, f"Failed to decode current image: {e}")
 
         img_h, img_w = current_img.shape[:2]
-        polygon_frac = _normalize_polygon(req.polygon, req.image_width or img_w, req.image_height or img_h)
+        # Use caller-supplied dimensions if provided (more reliable than decoded image size)
+        # This is the canonical resolution — all polygon normalization is relative to this
+        canonical_w = req.image_width  or img_w
+        canonical_h = req.image_height or img_h
+        polygon_frac = _normalize_polygon(req.polygon, canonical_w, canonical_h)
+        logger.info("Polygon normalized: canonical=%dx%d actual_current=%dx%d polygon_is_pixel=%s",
+                    canonical_w, canonical_h, img_w, img_h,
+                    any(p.x > 1.0 or p.y > 1.0 for p in req.polygon))
 
         # 2. Optional dynamic object removal
         clean_img = current_img
@@ -221,8 +303,15 @@ async def analyze(req: AnalyzeRequest):
         if current_crop.size == 0:
             raise HTTPException(400, "Polygon crop is empty — check coordinates")
 
-        # Decode reference images (already downloaded above)
+        # Decode + align reference images to current image before cropping.
+        # Alignment compensates for camera position shifts, slight pans/tilts/zooms
+        # that happen over time on site cameras. Without alignment, a shifted camera
+        # means the polygon crops a different physical area in old vs new images,
+        # causing the AI to compare unrelated zones and produce wrong scores.
         ref_crops: list[tuple[float, np.ndarray]] = []
+        align_succeeded = 0
+        align_failed    = 0
+
         for i, ref in enumerate(req.reference_images):
             ref_data = all_data[i + 1]
             if isinstance(ref_data, Exception):
@@ -230,13 +319,51 @@ async def analyze(req: AnalyzeRequest):
                 logger.warning("Reference %.0f%% failed: %s", ref.progress_pct, ref_data)
                 continue
             try:
-                ref_img  = _bytes_to_cv2(ref_data)
-                ref_crop = crop_zone(ref_img, polygon_frac)
+                ref_img = _bytes_to_cv2(ref_data)
+                ref_h, ref_w = ref_img.shape[:2]
+
+                if ref_w != canonical_w or ref_h != canonical_h:
+                    logger.warning(
+                        "Reference %.0f%%: resolution mismatch current=%dx%d ref=%dx%d",
+                        ref.progress_pct, canonical_w, canonical_h, ref_w, ref_h
+                    )
+
+                # Step 1 — Align reference image to current image coordinate space.
+                # This warps the reference so its features line up with the current image,
+                # compensating for any camera drift since that reference was taken.
+                # After alignment the same polygon_frac crops the same physical area
+                # in both current and reference images.
+                ref_aligned, did_align = _align_image_to_reference(ref_img, clean_img)
+                if did_align:
+                    align_succeeded += 1
+                else:
+                    align_failed += 1
+                    # Alignment failed — fall back to per-image polygon normalization
+                    # which at least handles resolution differences
+                    ref_aligned = cv2.resize(ref_img, (canonical_w, canonical_h),
+                                             interpolation=cv2.INTER_AREA)
+
+                # Step 2 — Crop using the canonical polygon (already in fraction coords
+                # relative to current image, which reference is now aligned to)
+                ref_crop = crop_zone(ref_aligned, polygon_frac)
+
                 if ref_crop.size > 0:
                     ref_crops.append((ref.progress_pct, ref_crop))
+                    logger.info("Reference %.0f%%: aligned=%s crop=%dx%d",
+                                ref.progress_pct, did_align,
+                                ref_crop.shape[1], ref_crop.shape[0])
+                else:
+                    alerts.append(f"Reference {ref.progress_pct}% crop was empty after alignment")
+                    logger.warning("Reference %.0f%%: empty crop after alignment", ref.progress_pct)
+
             except Exception as e:
                 alerts.append(f"Reference {ref.progress_pct}% failed to decode")
                 logger.warning("Reference %.0f%% decode failed: %s", ref.progress_pct, e)
+
+        if align_succeeded > 0:
+            logger.info("Alignment summary: %d succeeded, %d fell back", align_succeeded, align_failed)
+        if align_failed > 0 and align_succeeded == 0:
+            alerts.append(f"Camera alignment failed for all references — results may be less accurate if camera has shifted")
 
         if not ref_crops:
             raise HTTPException(400, "No reference images could be loaded")
@@ -251,32 +378,40 @@ async def analyze(req: AnalyzeRequest):
             for i, (pct, _) in enumerate(ref_crops_sorted)
         )
 
-        ai_prompt = f"""You are a construction site progress analyst. You must give a PRECISE and CONSISTENT score.
+        ai_prompt = f"""You are a senior construction site progress analyst. Your job is to score Image 1 (current site) by comparing its PHYSICAL STRUCTURES against the reference images.
 
-You are given {len(ref_crops_sorted) + 1} images in order:
-- Image 1: CURRENT SITE PHOTO — you must score this image
-- Images 2 to {len(ref_crops_sorted) + 1}: REFERENCE photos at KNOWN completion percentages:
+IMAGE ORDER:
+- Image 1: CURRENT SITE PHOTO — score this image
+- Images 2 to {len(ref_crops_sorted) + 1}: REFERENCE photos at KNOWN completion percentages (ground truth):
 {ref_list_str}
 
 Zone: {req.zone_name}
 
-SCORING RULES (follow strictly):
-1. Study Image 1 (current) carefully — count visible structural elements: rebar density, formwork panels, concrete pours, installed components.
-2. Compare Image 1 against EACH reference image one by one.
-3. Find the two references Image 1 falls BETWEEN based on physical structure visible.
-4. If Image 1 matches reference X% exactly → score = X.
-5. If Image 1 is between reference A% and reference B% → score = A + ((B-A) * how far between them).
-6. NEVER guess. Base score ONLY on visible physical construction progress.
-7. Ignore workers, vehicles, lighting, weather, shadows.
-8. Rebar cage assembled = early stage (10-30%). Formwork = mid stage (40-60%). Concrete poured = late (70-100%).
+CRITICAL INSTRUCTIONS:
+1. Look ONLY at permanent structural elements in each image: steel members, rebar, formwork panels, concrete, installed components, completed assemblies.
+2. DO NOT be influenced by: lighting, time of day, weather, shadows, dust, workers, vehicles, camera angle differences, image brightness.
+3. Compare the QUANTITY and COMPLETENESS of structural elements in Image 1 vs each reference.
+4. Ask yourself for each reference: "Does Image 1 have MORE structure built than this reference, LESS, or the SAME?"
+5. Find the two consecutive references where Image 1 falls BETWEEN them based on how much is built.
+6. The reference with the most similar AMOUNT OF COMPLETED STRUCTURE is your anchor — not the most visually similar image overall.
+7. IMPORTANT: A recent reference photo and the current photo may look visually similar due to same camera/lighting — judge by WHAT IS BUILT, not overall visual similarity.
+8. If Image 1 shows MORE structure than reference at X% and LESS than reference at Y%, your score must be between X and Y.
 
-Return ONLY this JSON:
+STEP BY STEP:
+Step 1 — Describe Image 1: What permanent structures are visible? How complete are they?
+Step 2 — For each reference from lowest % to highest %: does Image 1 have more or less built?
+Step 3 — Identify the two references Image 1 falls between.
+Step 4 — Score based on how far between those two references Image 1 sits structurally.
+
+Return ONLY this JSON (no extra text):
 {{
-  "progress_pct": <integer 0-100, must match one of the reference % values or be between two of them>,
-  "closest_reference_pct": <the single reference % Image 1 most closely matches>,
-  "stage_label": "<one line: what construction stage is visible in Image 1>",
+  "progress_pct": <integer 0-100>,
+  "closest_reference_pct": <the reference % whose structural completion most closely matches Image 1>,
+  "lower_bound_pct": <reference % just below current progress>,
+  "upper_bound_pct": <reference % just above current progress>,
+  "stage_label": "<one line describing the construction stage visible in Image 1>",
   "confidence": <0.0-1.0>,
-  "reasoning": "<3 sentences: (1) what structural elements you see in Image 1, (2) which two references it falls between and why, (3) exact % chosen>"
+  "reasoning": "<4 sentences: (1) permanent structures visible in Image 1, (2) which reference has less built and why, (3) which reference has more built and why, (4) exact % chosen and why>"
 }}"""
 
         logger.info("Calling Azure AI (3 parallel votes)...")
