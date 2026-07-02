@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from construction_progress.core.azure_client import AzureVisionClient
 from construction_progress.pipeline.zone_analyzer import ZoneAnalyzer, crop_zone, image_to_bytes
 from construction_progress.pipeline.preprocessor import ConstructionPreprocessor
+from construction_progress.pipeline.reference_matcher import _image_similarity
 from construction_progress.config import DEPLOYMENT_NAME
 
 warnings.filterwarnings("ignore")
@@ -100,6 +101,7 @@ class AnalyzeResponse(BaseModel):
     visible_elements: list[str]
     structural_description: str
     processed_image_base64: str
+    azure_raw_response: Optional[dict] = Field(default=None, description="Raw Azure AI server response for the winning (median) scoring vote")
     error: Optional[str] = None
 
 
@@ -242,6 +244,20 @@ def _to_base64(image: np.ndarray, quality: int = 88) -> str:
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
+def _validate_summary_pct(summary: str, final_pct: float, tolerance: float = 5.0) -> bool:
+    """
+    True only if every percentage mentioned in the AI-written summary is within
+    `tolerance` of final_pct. The summary prompt also feeds the model reasoning
+    text that references *reference* percentages (e.g. "closest to the 50%
+    reference"), which the model can echo as if it were the actual score —
+    catch that here rather than trusting free-text generation to self-report
+    the number correctly.
+    """
+    import re
+    mentioned = [float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", summary)]
+    return all(abs(pct - final_pct) <= tolerance for pct in mentioned)
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -368,21 +384,46 @@ async def analyze(req: AnalyzeRequest):
         if not ref_crops:
             raise HTTPException(400, "No reference images could be loaded")
 
-        # 5. AI visual comparison — 3-vote majority for consistency
+        # 5. Rank references by structural similarity to the current crop — the
+        # caller-supplied progress_pct labels are manually entered and can be
+        # wrong or drift over time, so label order is never trusted as ground
+        # truth. Similarity rank (0=most alike, N=least alike) is the actual
+        # signal driving comparison order; the label is shown only as extra
+        # context for the AI, not as the primary ordering.
+        ref_ranked = sorted(
+            (( _image_similarity(current_crop, crop), pct, crop) for pct, crop in ref_crops),
+            key=lambda x: x[0], reverse=True,
+        )
+
+        # Flag references whose label ordering contradicts their similarity ordering —
+        # e.g. a reference labelled with a low % that is structurally closer to current
+        # than references labelled with higher %, which suggests a mislabeled entry.
+        by_label = sorted(ref_crops, key=lambda x: x[0])
+        sim_by_pct = {pct: sim for sim, pct, _ in ref_ranked}
+        for i in range(len(by_label) - 1):
+            pct_a, _ = by_label[i]
+            pct_b, _ = by_label[i + 1]
+            if pct_a == pct_b:
+                continue
+            if sim_by_pct[pct_a] > sim_by_pct[pct_b] + 0.15:
+                alerts.append(
+                    f"Reference labels may be inconsistent: {pct_a:.0f}% is structurally more similar "
+                    f"to current than {pct_b:.0f}% — check reference data"
+                )
+
         client = get_client()
-        ref_crops_sorted = sorted(ref_crops, key=lambda x: x[0])
-        all_image_bytes  = [image_to_bytes(current_crop)] + [image_to_bytes(c) for _, c in ref_crops_sorted]
+        all_image_bytes = [image_to_bytes(current_crop)] + [image_to_bytes(crop) for _, _, crop in ref_ranked]
 
         ref_list_str = "\n".join(
-            f"  Image {i+2}: Reference at {pct:.0f}% — look for structural elements present at this stage"
-            for i, (pct, _) in enumerate(ref_crops_sorted)
+            f"  Image {i+2}: labelled {pct:.0f}% (structural similarity rank {i+1} of {len(ref_ranked)}, most-similar first)"
+            for i, (sim, pct, _) in enumerate(ref_ranked)
         )
 
         ai_prompt = f"""You are a senior construction site progress analyst. Your job is to score Image 1 (current site) by comparing its PHYSICAL STRUCTURES against the reference images.
 
-IMAGE ORDER:
+IMAGE ORDER (sorted by structural similarity to Image 1, most similar first — NOT by label):
 - Image 1: CURRENT SITE PHOTO — score this image
-- Images 2 to {len(ref_crops_sorted) + 1}: REFERENCE photos at KNOWN completion percentages (ground truth):
+- Images 2 to {len(ref_ranked) + 1}: REFERENCE photos, each with a manually-entered label (labels may be wrong or inconsistent — treat them as a hint, not ground truth):
 {ref_list_str}
 
 Zone: {req.zone_name}
@@ -392,16 +433,16 @@ CRITICAL INSTRUCTIONS:
 2. DO NOT be influenced by: lighting, time of day, weather, shadows, dust, workers, vehicles, camera angle differences, image brightness.
 3. Compare the QUANTITY and COMPLETENESS of structural elements in Image 1 vs each reference.
 4. Ask yourself for each reference: "Does Image 1 have MORE structure built than this reference, LESS, or the SAME?"
-5. Find the two consecutive references where Image 1 falls BETWEEN them based on how much is built.
-6. The reference with the most similar AMOUNT OF COMPLETED STRUCTURE is your anchor — not the most visually similar image overall.
-7. IMPORTANT: A recent reference photo and the current photo may look visually similar due to same camera/lighting — judge by WHAT IS BUILT, not overall visual similarity.
-8. If Image 1 shows MORE structure than reference at X% and LESS than reference at Y%, your score must be between X and Y.
+5. Find the two references (by actual structural completeness, not by their labels) that bracket Image 1.
+6. IMPORTANT: reference labels are manually entered and may be wrong — if a label contradicts what you visually observe (e.g. a "10%" reference clearly shows more built structure than a "50%" reference), trust your own structural observation over the label.
+7. Judge by WHAT IS BUILT, not overall visual similarity (camera/lighting can make unrelated stages look alike).
+8. Your final score should be consistent with the actual amount of structure visible in Image 1, bounded by the labels of whichever references are genuinely less/more built — not by label order alone.
 
 STEP BY STEP:
 Step 1 — Describe Image 1: What permanent structures are visible? How complete are they?
-Step 2 — For each reference from lowest % to highest %: does Image 1 have more or less built?
-Step 3 — Identify the two references Image 1 falls between.
-Step 4 — Score based on how far between those two references Image 1 sits structurally.
+Step 2 — For each reference, judged purely by what's built (ignore its label for this step): does Image 1 have more or less built?
+Step 3 — Identify the two references — by actual structural completeness — Image 1 falls between.
+Step 4 — Score based on how far between those two references' labels Image 1 sits structurally. If labels seem inconsistent with what's built, note this in your reasoning and pick the score that best reflects genuine structural progress.
 
 Return ONLY this JSON (no extra text):
 {{
@@ -416,26 +457,28 @@ Return ONLY this JSON (no extra text):
 
         logger.info("Calling Azure AI (3 parallel votes)...")
 
-        async def _vote() -> dict:
+        async def _vote() -> tuple[dict, Optional[dict]]:
             try:
-                return await client.ask_json_async(
+                parsed, raw = await client.ask_json_async(
                     prompt=ai_prompt,
                     image_bytes_list=all_image_bytes,
                     max_tokens=700,
                     temperature=0.0,
+                    return_raw=True,
                 )
+                return parsed, raw
             except Exception as e:
                 logger.warning("Vote failed: %s", e)
-                return {}
+                return {}, None
 
         results = await asyncio.gather(_vote(), _vote(), _vote())
 
-        votes: list[float] = []
-        last_result: dict = {}
-        for r in results:
-            if r and "progress_pct" in r:
-                votes.append(float(r["progress_pct"]))
-                last_result = r
+        votes: list[tuple[float, dict, Optional[dict]]] = []
+        for parsed, raw in results:
+            if parsed and "progress_pct" in parsed:
+                votes.append((float(parsed["progress_pct"]), parsed, raw))
+
+        azure_raw_response: Optional[dict] = None
 
         if not votes:
             final_pct        = 0.0
@@ -445,13 +488,14 @@ Return ONLY this JSON (no extra text):
             method           = "failed"
             alerts.append("AI comparison failed — all 3 votes errored")
         else:
-            votes_sorted = sorted(votes)
-            final_pct        = float(votes_sorted[len(votes_sorted) // 2])
+            votes_sorted = sorted(votes, key=lambda v: v[0])
+            median_pct, last_result, azure_raw_response = votes_sorted[len(votes_sorted) // 2]
+            final_pct        = median_pct
             stage_label      = last_result.get("stage_label", "")
             reasoning        = last_result.get("reasoning", "")
             final_confidence = round(float(last_result.get("confidence", 0.7)), 3)
             method           = f"ai_visual_comparison_votes={len(votes)}"
-            logger.info("Votes %s -> median %.1f%%", votes, final_pct)
+            logger.info("Votes %s -> median %.1f%%", [v[0] for v in votes], final_pct)
 
         # 6. Feature extraction for visible elements + structural description
         zone_cfg = {"id": req.zone_id, "name": req.zone_name, "polygon": polygon_frac, "milestone_description": req.milestone_description}
@@ -463,15 +507,24 @@ Return ONLY this JSON (no extra text):
             alerts.append("Zone partially occluded — result may be less accurate")
 
         # 7. Site summary
+        fallback_summary = f"{req.zone_name} is at {final_pct:.1f}% completion — {stage_label}."
         try:
             site_summary = client.ask(
                 f"Construction zone '{req.zone_name}' is at {final_pct:.1f}% ({stage_label}), confidence {final_confidence:.0%}. "
                 f"Visible: {', '.join(feats.visible_elements) or 'none'}. {reasoning} "
-                f"Write a 2-sentence executive summary. Plain text only.",
+                f"Write a 2-sentence executive summary. Plain text only. "
+                f"The completion percentage MUST be stated as exactly {final_pct:.1f}% — do not restate any other percentage from the reasoning above.",
                 max_tokens=120,
             )
+            if not _validate_summary_pct(site_summary, final_pct):
+                logger.warning(
+                    "Site summary mentioned a percentage inconsistent with final_pct=%.1f — using fallback. Got: %s",
+                    final_pct, site_summary,
+                )
+                alerts.append("AI summary text was inconsistent with the score — used fallback summary")
+                site_summary = fallback_summary
         except Exception:
-            site_summary = f"{req.zone_name} is at {final_pct:.1f}% completion — {stage_label}."
+            site_summary = fallback_summary
 
         # 8. Annotated image with polygon overlay
         annotated = _draw_zone(clean_img, polygon_frac, req.zone_name, final_pct, final_confidence, stage_label)
@@ -497,6 +550,7 @@ Return ONLY this JSON (no extra text):
             )],
             visible_elements=feats.visible_elements,
             structural_description=feats.structural_description,
+            azure_raw_response=azure_raw_response,
             processed_image_base64=processed_image_b64,
         )
 

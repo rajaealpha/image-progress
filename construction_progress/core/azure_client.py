@@ -210,7 +210,8 @@ class AzureVisionClient:
         image_bytes_list: list[bytes],
         max_tokens: int = 700,
         temperature: float = 0.0,
-    ) -> dict:
+        return_raw: bool = False,
+    ):
         content_parts = [
             {"type": "input_image", "image_url": f"data:image/jpeg;base64,{_encode_image_bytes(b)}"}
             for b in image_bytes_list
@@ -222,18 +223,23 @@ class AzureVisionClient:
             "max_output_tokens": max_tokens,
             "temperature": temperature,
         }
-        raw = self._extract_text(await self._async_post(payload))
+        raw_response = await self._async_post(payload)
+        raw = self._extract_text(raw_response)
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
         try:
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError:
             import re
             m = re.search(r"(\{.*\})", cleaned, re.DOTALL)
             if m:
-                return json.loads(m.group(1))
-            raise ValueError(f"Could not parse JSON: {raw[:300]}")
+                parsed = json.loads(m.group(1))
+            else:
+                raise ValueError(f"Could not parse JSON: {raw[:300]}")
+        if return_raw:
+            return parsed, raw_response
+        return parsed
 
     def close(self):
         self._client.close()
