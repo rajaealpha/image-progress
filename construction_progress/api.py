@@ -27,7 +27,14 @@ from construction_progress.core.azure_client import AzureVisionClient
 from construction_progress.pipeline.zone_analyzer import ZoneAnalyzer, crop_zone, image_to_bytes
 from construction_progress.pipeline.preprocessor import ConstructionPreprocessor
 from construction_progress.pipeline.reference_matcher import _image_similarity
+from construction_progress.storage.score_store import get_last_score, set_last_score
 from construction_progress.config import DEPLOYMENT_NAME
+
+# Max points a zone's score is allowed to drop between calls before it's
+# clamped back to the previous value. Mirrors ProgressScorer's regression
+# guard in the batch pipeline — construction doesn't undo itself, so a big
+# drop almost always means noisy AI reading, not real regression.
+REGRESSION_GUARD_PCT = 5.0
 
 warnings.filterwarnings("ignore")
 

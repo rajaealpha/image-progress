@@ -3,13 +3,18 @@ Central configuration — update DEPLOYMENT_NAME once you confirm it
 from your Azure AI Foundry portal (AI Foundry > hci-bbs-proj > Deployments).
 """
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ── Azure AI Foundry ──────────────────────────────────────────────────────────
-AZURE_ENDPOINT = "https://hci-bbs-aifoundry.services.ai.azure.com/api/projects/hci-bbs-proj/openai/v1/responses"
-AZURE_API_KEY  = "DqlF0uj0FmPBZzzVxUpRwjie68jzfLWsQpZts9SsNldYyxMAhEnbJQQJ99CCAC77bzfXJ3w3AAAAACOGP5t8"
+AZURE_ENDPOINT = os.environ["AZURE_ENDPOINT"]
+AZURE_API_KEY  = os.environ["AZURE_API_KEY"]
 
 # Set this to the exact deployment name shown in your Azure portal
 # e.g. "gpt-4o", "gpt-4o-deployment", "hci-vision-model", etc.
-DEPLOYMENT_NAME = "gpt-5.2-hci-bbs"
+DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-5.2-hci-bbs")
 
 # ── Pipeline tuning ───────────────────────────────────────────────────────────
 # Minimum confidence score (0-1) below which a zone is flagged for human review

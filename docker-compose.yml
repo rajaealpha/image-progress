@@ -6,6 +6,8 @@ services:
       - "0.0.0.0:5001:5001"
     volumes:
       - ./construction_progress/data:/app/construction_progress/data
+    env_file:
+      - .env
     environment:
       - PYTHONIOENCODING=utf-8
     restart: unless-stopped
